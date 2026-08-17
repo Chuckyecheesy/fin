@@ -15,12 +15,14 @@ vi.mock("recharts", () => ({
 vi.mock("lightweight-charts", () => ({
   createChart: () => ({
     addLineSeries: () => ({ setData: vi.fn(), update: vi.fn() }),
+    addSeries: () => ({ setData: vi.fn(), update: vi.fn() }),
     timeScale: () => ({ fitContent: vi.fn() }),
     applyOptions: vi.fn(),
     remove: vi.fn(),
   }),
   ColorType: { Solid: 0 },
   LineType: { Simple: 0 },
+  LineSeries: Symbol("LineSeries"),
 }));
 
 // Mock EventSource for useMarketData
@@ -29,6 +31,8 @@ class MockEventSource {
   onmessage: ((e: MessageEvent) => void) | null = null;
   onerror: (() => void) | null = null;
   close = vi.fn();
+  addEventListener = vi.fn();
+  removeEventListener = vi.fn();
   constructor() {
     setTimeout(() => this.onopen?.(), 0);
   }
