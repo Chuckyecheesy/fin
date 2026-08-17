@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from litellm import acompletion
 
 from app.database import get_db
+from app.portfolio import TradeError, execute_trade_core
 
 router = APIRouter()
 
@@ -204,94 +205,17 @@ def _mock_response(message: str) -> ChatResponse:
 async def _execute_trade(
     db, ticker: str, side: str, quantity: float
 ) -> str | None:
-    """Execute a trade. Returns error string on failure, None on success."""
-    # We need a price. Use avg_cost for sells, or a default for buys.
-    # In a full system this comes from the price cache. For now, use a
-    # placeholder price of 100.0 if no market data is available.
-    # TODO: integrate with market data price cache when available
-    price = 150.0  # default placeholder
+    """Execute a trade at the live market price. Returns error string on
+    failure, None on success.
 
-    now = datetime.now(timezone.utc).isoformat()
-
-    if side == "buy":
-        cost = price * quantity
-        cur = await db.execute(
-            "SELECT cash_balance FROM users_profile WHERE id = 'default'"
-        )
-        row = await cur.fetchone()
-        cash = row["cash_balance"]
-        if cost > cash:
-            return f"Insufficient cash: need ${cost:,.2f} but only have ${cash:,.2f}"
-
-        # Deduct cash
-        await db.execute(
-            "UPDATE users_profile SET cash_balance = cash_balance - ? WHERE id = 'default'",
-            (cost,),
-        )
-
-        # Upsert position
-        cur = await db.execute(
-            "SELECT quantity, avg_cost FROM positions WHERE user_id = 'default' AND ticker = ?",
-            (ticker,),
-        )
-        existing = await cur.fetchone()
-        if existing:
-            old_qty = existing["quantity"]
-            old_cost = existing["avg_cost"]
-            new_qty = old_qty + quantity
-            new_avg = ((old_qty * old_cost) + (quantity * price)) / new_qty
-            await db.execute(
-                "UPDATE positions SET quantity = ?, avg_cost = ?, updated_at = ? "
-                "WHERE user_id = 'default' AND ticker = ?",
-                (new_qty, new_avg, now, ticker),
-            )
-        else:
-            await db.execute(
-                "INSERT INTO positions (id, user_id, ticker, quantity, avg_cost, updated_at) "
-                "VALUES (?, 'default', ?, ?, ?, ?)",
-                (str(uuid.uuid4()), ticker, quantity, price, now),
-            )
-
-    elif side == "sell":
-        cur = await db.execute(
-            "SELECT quantity, avg_cost FROM positions WHERE user_id = 'default' AND ticker = ?",
-            (ticker,),
-        )
-        existing = await cur.fetchone()
-        if not existing or existing["quantity"] < quantity:
-            held = existing["quantity"] if existing else 0
-            return f"Insufficient shares: want to sell {quantity} {ticker} but hold {held}"
-
-        price = existing["avg_cost"]  # sell at avg cost for now
-        proceeds = price * quantity
-        new_qty = existing["quantity"] - quantity
-
-        await db.execute(
-            "UPDATE users_profile SET cash_balance = cash_balance + ? WHERE id = 'default'",
-            (proceeds,),
-        )
-
-        if new_qty <= 0:
-            await db.execute(
-                "DELETE FROM positions WHERE user_id = 'default' AND ticker = ?",
-                (ticker,),
-            )
-        else:
-            await db.execute(
-                "UPDATE positions SET quantity = ?, updated_at = ? "
-                "WHERE user_id = 'default' AND ticker = ?",
-                (new_qty, now, ticker),
-            )
-    else:
-        return f"Invalid side: {side}"
-
-    # Record trade
-    await db.execute(
-        "INSERT INTO trades (id, user_id, ticker, side, quantity, price, executed_at) "
-        "VALUES (?, 'default', ?, ?, ?, ?, ?)",
-        (str(uuid.uuid4()), ticker, side, quantity, price, now),
-    )
-    await db.commit()
+    Delegates to portfolio.execute_trade_core so LLM-initiated trades go
+    through the exact same validation and fill at the exact same price as
+    manual trades placed through the portfolio API (SPEC.md section 9).
+    """
+    try:
+        await execute_trade_core(db, ticker, quantity, side)
+    except TradeError as e:
+        return str(e)
     return None
 
 
@@ -331,19 +255,30 @@ async def _execute_watchlist_change(db, ticker: str, action: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+LLM_MODEL = "openrouter/openai/gpt-oss-120b"
+LLM_EXTRA_BODY = {"provider": {"order": ["cerebras"]}}
+
+
 async def _call_llm(messages: list[dict]) -> ChatResponse:
-    """Call LLM via LiteLLM -> OpenRouter and parse structured response."""
+    """Call LLM via LiteLLM -> OpenRouter, pinned to Cerebras, with
+    structured outputs. Returns a graceful fallback ChatResponse instead of
+    raising if the LLM response is malformed (SPEC.md section 12)."""
     response = await acompletion(
-        model="openrouter/openai/gpt-oss-120b",
+        model=LLM_MODEL,
         messages=messages,
-        extra_body={
-            "response_format": {"type": "json_object"},
-        },
+        response_format=ChatResponse,
+        reasoning_effort="low",
+        extra_body=LLM_EXTRA_BODY,
     )
 
     content = response.choices[0].message.content
-    parsed = json.loads(content)
-    return ChatResponse(**parsed)
+    try:
+        return ChatResponse.model_validate_json(content)
+    except ValueError:
+        # Covers both malformed JSON and schema-mismatched responses.
+        return ChatResponse(
+            message="Sorry, I had trouble processing that response. Could you try again?"
+        )
 
 
 # ---------------------------------------------------------------------------

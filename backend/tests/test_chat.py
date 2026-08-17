@@ -4,10 +4,21 @@ import os
 
 os.environ["LLM_MOCK"] = "true"
 
+import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
 from app.main import app
+from app.market.cache import price_cache
+
+
+@pytest.fixture(autouse=True)
+def seed_prices():
+    """Seed price cache with test prices so trades fill at a known price."""
+    price_cache.update("AAPL", 150.0)
+    price_cache.update("TSLA", 250.0)
+    yield
+    price_cache._prices.clear()
 
 
 @pytest_asyncio.fixture
@@ -40,7 +51,7 @@ async def test_chat_greeting(client):
 
 
 async def test_chat_buy_aapl(client):
-    """Mock buy always buys 10 shares of the matched ticker at $150."""
+    """Mock buy always buys 10 shares of the matched ticker."""
     resp = await client.post("/api/chat", json={"message": "buy some AAPL"})
     assert resp.status_code == 200
     data = resp.json()
@@ -52,6 +63,39 @@ async def test_chat_buy_aapl(client):
     assert trade["quantity"] == 10
     # No errors appended
     assert "Errors" not in data["message"]
+
+
+async def test_chat_buy_fills_at_live_price_not_hardcoded(client):
+    """AI-initiated buys must fill at the live price_cache price, not a
+    hardcoded placeholder (fin-83b). Seed a price far from any hardcoded
+    stand-in (e.g. the old 150.0 placeholder) and verify the resulting
+    position's avg_cost matches the seeded live price."""
+    price_cache.update("AAPL", 321.45)
+
+    resp = await client.post("/api/chat", json={"message": "buy some AAPL"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "Errors" not in data["message"]
+
+    portfolio = await client.get("/api/portfolio")
+    positions = portfolio.json()["positions"]
+    assert len(positions) == 1
+    assert positions[0]["ticker"] == "AAPL"
+    assert positions[0]["avg_cost"] == 321.45
+
+
+async def test_chat_buy_no_price_available(client):
+    """Buying a ticker with no live price should fail with a clear error,
+    not silently fill at a placeholder price."""
+    price_cache._prices.clear()  # AAPL has no seeded price in this test
+
+    resp = await client.post("/api/chat", json={"message": "buy some AAPL"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "no price available" in data["message"].lower()
+
+    portfolio = await client.get("/api/portfolio")
+    assert portfolio.json()["positions"] == []
 
 
 async def test_chat_sell_insufficient(client):
